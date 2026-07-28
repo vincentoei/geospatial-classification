@@ -74,9 +74,7 @@ line-length = 100
 target-version = ["py39", "py310", "py311"]
 include = '\.pyi?$'
 extend-exclude = '''
-/(
-  | notebooks
-  | notebooks_refactored
+/(\n    notebooks
 )/
 '''
 
@@ -84,7 +82,7 @@ extend-exclude = '''
 profile = "black"
 line_length = 100
 known_first_party = ["geospatial_classification"]
-skip = ["notebooks", "notebooks_refactored"]
+skip = ["notebooks"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -101,7 +99,6 @@ exclude = [
     ".git",
     "__pycache__",
     "notebooks",
-    "notebooks_refactored",
     "build",
     "dist",
 ]
@@ -114,6 +111,5 @@ disallow_untyped_defs = true
 ignore_missing_imports = true
 exclude = [
     "notebooks",
-    "notebooks_refactored",
     "tests",
 ]

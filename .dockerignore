@@ -10,7 +10,6 @@ venv/
 .gitignore
 *.md
 notebooks/
-notebooks_refactored/
 images_dataSAT/
 images-dataSAT.tar
 *.tar
