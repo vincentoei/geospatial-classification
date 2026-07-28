@@ -1,6 +1,6 @@
 """Pydantic schemas for the prediction API."""
 
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -32,7 +32,21 @@ class AreaPredictionRequest(BaseModel):
         description="List of [lng, lat] coordinates forming a closed polygon",
     )
     zoom: int = Field(16, ge=1, le=22, description="Mapbox zoom level (default 16)")
-    grid_size: int = Field(5, ge=2, le=20, description="Grid size (default 5)")
+    grid_size: Optional[int] = Field(
+        None,
+        ge=2,
+        le=20,
+        description="Deprecated: grid density is now computed automatically.",
+    )
+
+
+class TileBounds(BaseModel):
+    """Geographic bounds of a single 64×64 tile."""
+
+    north: float
+    south: float
+    east: float
+    west: float
 
 
 class GridPoint(BaseModel):
@@ -43,7 +57,7 @@ class GridPoint(BaseModel):
     prediction: Literal["agri", "non-agri"]
     confidence: float
     probabilities: dict[str, float]
-    image_url: str
+    tile_bounds: TileBounds
 
 
 class AreaPredictionResponse(BaseModel):

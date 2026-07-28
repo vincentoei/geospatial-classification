@@ -1,7 +1,11 @@
 """Prediction API routes."""
 
 import logging
+import os
+from functools import lru_cache
+from pathlib import Path
 
+from dotenv import load_dotenv
 from fastapi import APIRouter, HTTPException
 
 from api.app.schemas import (
@@ -11,6 +15,9 @@ from api.app.schemas import (
     PointPredictionResponse,
 )
 from api.app.services import ModelService, SatelliteService
+from api.app.services.tiling import AreaTooLargeError, TilingService
+
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +25,16 @@ router = APIRouter(prefix="/api/v1/predict", tags=["predict"])
 
 model_service = ModelService()
 satellite_service = SatelliteService()
+
+MAX_AREA_PATCHES = int(os.getenv("MAX_AREA_PATCHES", "200"))
+
+
+@lru_cache
+def _tiling_service() -> TilingService:
+    token = os.getenv("MAPBOX_ACCESS_TOKEN", "")
+    if not token:
+        raise RuntimeError("MAPBOX_ACCESS_TOKEN not set in environment")
+    return TilingService(token)
 
 
 @router.post("/point", response_model=PointPredictionResponse)
@@ -60,59 +77,49 @@ async def predict_point(request: PointPredictionRequest) -> dict:
 async def predict_area(request: AreaPredictionRequest) -> dict:
     """Classify an area (polygon) on the map as agricultural or non-agricultural land.
 
-    - Generates a grid of points within the polygon
-    - Fetches satellite tiles for each point
-    - Runs CNN-ViT inference on GPU for each point
-    - Returns aggregated statistics with per-point results
+    - Generates a dense 64×64 tile grid covering the polygon
+    - Fetches satellite tiles from Mapbox and slices them locally
+    - Runs CNN-ViT inference on GPU in batches
+    - Returns aggregated statistics with per-tile results
     """
-    try:
-        # 1. Generate grid points within polygon
-        grid_points = _generate_grid_points(request.polygon, grid_size=request.grid_size)
+    tiling_service = _tiling_service()
+    zoom = request.zoom
 
-        if not grid_points:
+    try:
+        # 1. Generate 64×64 patches covering the polygon
+        patches = tiling_service.generate_patches(
+            request.polygon, zoom=zoom, max_patches=MAX_AREA_PATCHES
+        )
+
+        if not patches:
             raise HTTPException(status_code=400, detail="No grid points generated from polygon")
 
-        # 2. Run inference on each grid point
-        results = []
-        for point in grid_points:
-            try:
-                image = satellite_service.fetch_image(point["lat"], point["lng"], request.zoom)
-                preprocessed = satellite_service.preprocess(image)
-                tensor = preprocessed["tensor"]
-                result = model_service.predict(tensor)
-                image_url = satellite_service.get_image_url(
-                    point["lat"], point["lng"], request.zoom
-                )
+        # 2. Fetch tiles and crop patches
+        tile_images = await tiling_service.fetch_tiles(patches, zoom=zoom)
+        batch_tensor = tiling_service.crop_and_preprocess(patches, tile_images)
 
-                results.append(
-                    {
-                        "lat": point["lat"],
-                        "lng": point["lng"],
-                        "prediction": result["prediction"],
-                        "confidence": result["confidence"],
-                        "probabilities": result["probabilities"],
-                        "image_url": image_url,
-                    }
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Failed to predict point (%s, %s): %s",
-                    point["lat"],
-                    point["lng"],
-                    exc,
-                )
-                continue
+        # 3. Batch inference
+        results = model_service.predict_batch(batch_tensor)
 
-        if not results:
-            raise HTTPException(status_code=500, detail="All grid points failed to predict")
+        # 4. Build response
+        grid_points = []
+        for patch, result in zip(patches, results):
+            grid_points.append(
+                {
+                    "lat": patch.lat,
+                    "lng": patch.lng,
+                    "prediction": result["prediction"],
+                    "confidence": result["confidence"],
+                    "probabilities": result["probabilities"],
+                    "tile_bounds": patch.bounds,
+                }
+            )
 
-        # 3. Calculate statistics
         agri_count = sum(1 for r in results if r["prediction"] == "agri")
         non_agri_count = len(results) - agri_count
         agri_percentage = (agri_count / len(results)) * 100 if results else 0
         avg_confidence = sum(r["confidence"] for r in results) / len(results)
 
-        # 4. Calculate bounding box (polygon is list of [lng, lat])
         lats = [p[1] for p in request.polygon]
         lngs = [p[0] for p in request.polygon]
         bounding_box = {
@@ -128,61 +135,18 @@ async def predict_area(request: AreaPredictionRequest) -> dict:
             "non_agri_points": non_agri_count,
             "agri_percentage": round(agri_percentage, 2),
             "avg_confidence": round(avg_confidence, 4),
-            "grid_points": results,
+            "grid_points": grid_points,
             "bounding_box": bounding_box,
         }
 
+    except AreaTooLargeError as exc:
+        logger.warning("Area too large: %s", exc)
+        raise HTTPException(
+            status_code=400,
+            detail="Area too large. Please draw a smaller area.",
+        )
     except HTTPException:
         raise
     except Exception as exc:
         logger.error("Area prediction failed: %s", exc)
         raise HTTPException(status_code=500, detail=f"Area prediction failed: {exc}")
-
-
-def _generate_grid_points(polygon: list[list[float]], grid_size: int = 5) -> list[dict]:
-    """Generate evenly spaced grid points within a polygon.
-
-    Args:
-        polygon: List of [lng, lat] coordinates
-        grid_size: Number of grid points per side
-
-    Returns:
-        List of {"lat": float, "lng": float} dictionaries
-    """
-    # Extract coordinates
-    lngs = [p[0] for p in polygon]
-    lats = [p[1] for p in polygon]
-
-    min_lng, max_lng = min(lngs), max(lngs)
-    min_lat, max_lat = min(lats), max(lats)
-
-    # Generate grid
-    points = []
-    for i in range(grid_size):
-        for j in range(grid_size):
-            lng = min_lng + (max_lng - min_lng) * (i / (grid_size - 1))
-            lat = min_lat + (max_lat - min_lat) * (j / (grid_size - 1))
-
-            # Simple point-in-polygon check (ray casting)
-            if _point_in_polygon(lng, lat, polygon):
-                points.append({"lat": lat, "lng": lng})
-
-    return points
-
-
-def _point_in_polygon(x: float, y: float, polygon: list[list[float]]) -> bool:
-    """Ray casting algorithm to check if point is inside polygon."""
-    n = len(polygon)
-    inside = False
-    p1x, p1y = polygon[0][0], polygon[0][1]
-    for i in range(n + 1):
-        p2x, p2y = polygon[i % n][0], polygon[i % n][1]
-        if y > min(p1y, p2y):
-            if y <= max(p1y, p2y):
-                if x <= max(p1x, p2x):
-                    if p1y != p2y:
-                        xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
-                    if p1x == p2x or x <= xinters:
-                        inside = not inside
-        p1x, p1y = p2x, p2y
-    return inside

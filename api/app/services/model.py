@@ -109,3 +109,43 @@ class ModelService:
                 "agri": float(prob_values[1]),
             },
         }
+
+    def predict_batch(self, image_tensors: torch.Tensor) -> list[dict]:
+        """Run inference on a batch of pre-processed image tensors.
+
+        Args:
+            image_tensors: (N, 3, 64, 64) tensor.
+
+        Returns:
+            List of dictionaries with prediction, confidence, and probabilities.
+        """
+        if self.model is None:
+            raise RuntimeError("Model not loaded")
+
+        if image_tensors.dim() == 3:
+            image_tensors = image_tensors.unsqueeze(0)
+
+        image_tensors = image_tensors.to(self.device)
+
+        with torch.no_grad():
+            logits = self.model(image_tensors)
+            probs = torch.softmax(logits, dim=1)
+
+        prob_values = probs.cpu().numpy()
+        results = []
+        for i in range(len(prob_values)):
+            pred_idx = int(prob_values[i].argmax())
+            confidence = float(prob_values[i][pred_idx])
+            labels = ["non-agri", "agri"]
+            results.append(
+                {
+                    "prediction": labels[pred_idx],
+                    "confidence": confidence,
+                    "probabilities": {
+                        "non-agri": float(prob_values[i][0]),
+                        "agri": float(prob_values[i][1]),
+                    },
+                }
+            )
+
+        return results
